@@ -9,17 +9,18 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-func (s *SSHServer) AuthLogCallback(conn ssh.ConnMetadata, method string, err error) {
+func (s *Server) AuthLogCallback(conn ssh.ConnMetadata, method string, err error) {
 	if err == nil {
-		s.Logger.Info(context.Background(), "Connection from '%s' using '%s'", conn.RemoteAddr().String(), method)
+		s.logger.Info(context.Background(), "Connection from '%s' using '%s'", conn.RemoteAddr().String(), method)
 	} else {
-		s.Logger.Error(context.Background(), "Connection error from '%s' using '%s' auth: %s", conn.RemoteAddr().String(), method, err.Error())
+		s.logger.Error(context.Background(), "Connection error from '%s' using '%s' auth: %s", conn.RemoteAddr().String(), method, err.Error())
 	}
 }
 
 // PublicKeyCallback handles public key authentication.
-func (s *SSHServer) PublicKeyCallback(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+func (s *Server) PublicKeyCallback(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 	if !slices.Contains(s.supportedKeyTypes, pubKey.Type()) {
+		s.logger.Error(context.Background(), "Unsupported key type '%s'", pubKey.Type())
 		return nil, ErrKeyNotSupported
 	}
 
@@ -41,16 +42,16 @@ func (s *SSHServer) PublicKeyCallback(c ssh.ConnMetadata, pubKey ssh.PublicKey) 
 }
 
 // PasswordAuth handles password authentication.
-func (s *SSHServer) PasswordAuth(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+func (s *Server) PasswordAuth(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 	return nil, ErrAuthFailedReason{errors.New("authentication method not supported")}
 }
 
 // NoAuthCallback handles scenarios where no authentication method is supported.
-func (s *SSHServer) NoAuthCallback(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
+func (s *Server) NoAuthCallback(conn ssh.ConnMetadata) (*ssh.Permissions, error) {
 	return nil, ErrAuthFailedReason{errors.New("authentication method not supported")}
 }
 
 // KeyboardInteractiveAuth handles keyboard-interactive authentication.
-func (s *SSHServer) KeyboardInteractiveAuth(conn ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+func (s *Server) KeyboardInteractiveAuth(conn ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
 	return nil, ErrAuthFailedReason{errors.New("authentication method not supported")}
 }

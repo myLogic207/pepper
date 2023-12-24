@@ -3,8 +3,17 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ed25519"
+	"crypto/rand"
+	"errors"
+	"sync"
 
 	"golang.org/x/crypto/ssh"
+)
+
+var (
+	ErrNoHostKey = errors.New("no host key set")
 )
 
 type Keystore interface {
@@ -20,55 +29,86 @@ type Keystore interface {
 	// GenerateUserKey(ctx context.Context, username string) (ssh.PublicKey, error)
 }
 
-type SSHKeystore struct {
+type sshKeystore struct {
+	sync.RWMutex
 	hostKey  ssh.Signer
 	userKeys map[string]ssh.PublicKey
 }
 
-func NewSSHKeystore(privatePemBytes []byte, passphrase string) (*SSHKeystore, error) {
-	signer, err := ssh.ParsePrivateKeyWithPassphrase(privatePemBytes, []byte(passphrase))
+func NewKeystore(privatePemBytes []byte, passphrase string) (Keystore, error) {
+	if len(privatePemBytes) == 0 {
+		return nil, ErrNoPrivateKey
+	}
+	var signer ssh.Signer
+	var err error
+	if len(passphrase) == 0 {
+		signer, err = ssh.ParsePrivateKey(privatePemBytes)
+	} else {
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(privatePemBytes, []byte(passphrase))
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	return &SSHKeystore{
+	return &sshKeystore{
 		hostKey:  signer,
 		userKeys: make(map[string]ssh.PublicKey),
 	}, nil
 }
 
-func (ks *SSHKeystore) SetHostKey(ctx context.Context, pemBytes []byte) error {
+func (ks *sshKeystore) SetHostKey(ctx context.Context, pemBytes []byte) error {
 	if signer, err := ssh.ParsePrivateKey(pemBytes); err != nil {
 		return err
 	} else {
+		ks.Lock()
 		ks.hostKey = signer
+		ks.Unlock()
 		return nil
 	}
 }
 
-func (ks *SSHKeystore) GetHostKey(ctx context.Context) (key ssh.Signer, err error) {
-	return ks.hostKey, nil
+func (ks *sshKeystore) GetHostKey(ctx context.Context) (key ssh.Signer, err error) {
+	ks.RLock()
+	if ks.hostKey == nil {
+		err = ErrNoHostKey
+	} else {
+		key = ks.hostKey
+	}
+	ks.RUnlock()
+	return
 }
 
-func (ks *SSHKeystore) AddKnownHost(ctx context.Context, hostIdentifier string, key ssh.PublicKey) error {
+func (ks *sshKeystore) AddKnownHost(ctx context.Context, hostIdentifier string, key ssh.PublicKey) error {
+	ks.Lock()
 	ks.userKeys[hostIdentifier] = key
+	ks.Unlock()
 	return nil
 }
 
-func (ks *SSHKeystore) CheckKnownHost(ctx context.Context, hostIdentifier string, key ssh.PublicKey) (ok bool, err error) {
-	if knownKey, ok := ks.userKeys[hostIdentifier]; ok {
-		return ks.comparePublickeys(knownKey, key), nil
-	} else {
+func (ks *sshKeystore) CheckKnownHost(ctx context.Context, hostIdentifier string, key ssh.PublicKey) (ok bool, err error) {
+	ks.RLock()
+	knownKey, ok := ks.userKeys[hostIdentifier]
+	ks.RUnlock()
+	if !ok {
 		return false, nil
 	}
+	return ks.comparePublickeys(knownKey, key), nil
 }
 
-func (ks *SSHKeystore) comparePublickeys(a, b ssh.PublicKey) bool {
+func (ks *sshKeystore) comparePublickeys(a, b ssh.PublicKey) bool {
 	if a.Type() != b.Type() {
 		return false
 	}
 
 	return bytes.Equal(a.Marshal(), b.Marshal())
+}
+
+func GenerateKey() (crypto.PrivateKey, error) {
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	return private, nil
 }
 
 // func (ks *SSHKeystore) GenerateUserKey(ctx context.Context, username string) (ssh.PublicKey, error) {

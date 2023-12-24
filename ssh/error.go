@@ -14,6 +14,9 @@ var (
 
 	// ErrSSHConfig indicates an error loading the SSH config.
 	ErrSSHConfig = errors.New("error loading ssh config")
+
+	// ErrNoPrivateKey indicates that no private key was provided.
+	ErrNoPrivateKey = errors.New("no private key provided")
 )
 
 type ErrSSHConfigReason struct {
