@@ -12,16 +12,14 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-var TESTSERVER *Server
 var testMsg = []byte("Hello World")
 
 const (
 	tADDRESS = "127.0.0.1"
 	tPORT    = "0"
-	tWORKERS = 3
 )
 
-func testHandle(ctx context.Context, conn net.Conn, args ...interface{}) error {
+func testHandle(ctx context.Context, conn net.Conn) error {
 	println("Handling connection")
 	if i, err := conn.Write(testMsg); err != nil {
 		println("Error writing to connection: ", err)
@@ -34,56 +32,55 @@ func testHandle(ctx context.Context, conn net.Conn, args ...interface{}) error {
 	return nil
 }
 
-func TestMain(m *testing.M) {
-	conf := config.NewWithInitialValues(map[string]interface{}{
-		"ADDRESS": tADDRESS,
-		"PORT":    tPORT,
-		"WORKERS": tWORKERS,
-	})
-	server, err := NewServer(conf, testHandle)
-	if err != nil {
-		panic(err)
-	}
-	TESTSERVER = server
-	m.Run()
-}
-
 func TestServe(t *testing.T) {
 	ctx := context.Background()
-	if err := TESTSERVER.Listen(ctx); err != nil {
+	conf, err := config.WithInitialValues(ctx, map[string]interface{}{
+		"ADDRESS": tADDRESS,
+		"PORT":    tPORT,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Log(conf.Sprint())
+	server := &Server{}
+	if err := server.Listen(ctx, conf); err != nil {
+		t.Fatal(err)
+	}
+
 	go func() {
-		if err := TESTSERVER.Serve(ctx); err != nil {
+		if err := server.Serve(ctx, testHandle); err != nil {
 			panic(err)
 		}
+		println("Server stopped")
 	}()
 
-	if err := TESTSERVER.Stop(ctx); err != nil {
+	<-time.After(1 * time.Millisecond)
+	// stop signal
+	if err := server.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestConnect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	conf := config.NewWithInitialValues(map[string]interface{}{
+	conf, err := config.WithInitialValues(ctx, map[string]interface{}{
 		"ADDRESS": tADDRESS,
 		"PORT":    tPORT,
 		"WORKERS": 1,
 	})
-
-	server, err := NewServer(conf, testHandle)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
-	if err := server.Listen(ctx); err != nil {
+	server := &Server{}
+
+	if err := server.Listen(ctx, conf); err != nil {
 		t.Fatal(err)
 	}
 	defer cancel()
 
 	go func() {
-		if err := server.Serve(ctx); err != nil {
+		if err := server.Serve(ctx, testHandle); err != nil {
 			panic(err)
 		}
 	}()
