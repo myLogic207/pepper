@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/Masterminds/squirrel"
 
@@ -31,7 +33,6 @@ var (
 )
 
 var defaultDBConfig = map[string]interface{}{
-	"INITPATH": "db.init.d",
 	"TYPE":     "postgres",
 	"HOST":     "localhost",
 	"PORT":     "5432",
@@ -43,26 +44,15 @@ var defaultDBConfig = map[string]interface{}{
 	"POOL": map[string]interface{}{
 		"CONNS_OPEN":    10,
 		"CONNS_IDLE":    5,
-		"MAX_LIFETIME":  0,
-		"MAX_IDLE_TIME": 0,
-	},
-	"CACHE": map[string]interface{}{
-		"ACTIVE": false,
+		"MAX_LIFETIME":  -1,
+		"MAX_IDLE_TIME": -1,
 	},
 	"LOGGER": map[string]interface{}{
-		"PREFIX":       "DATABASE",
-		"PREFIXLENGTH": 20,
-		"LEVEL":        "DEBUG",
-		"WRITERS": map[string]interface{}{
-			"STDOUT": true,
-			"FILE": map[string]interface{}{
-				"ACTIVE": true,
-			},
-		},
+		"PREFIX": "DATABASE",
 	},
 }
 
-type urlGenerator func(config.Config) (string, error)
+type urlGenerator func(context.Context, *config.Config) (string, error)
 
 var dbTypeLookup = map[string]urlGenerator{
 	PostgresDBType: newPostgresConnector,
@@ -72,61 +62,11 @@ var dbTypeLookup = map[string]urlGenerator{
 
 type DB struct {
 	*sql.DB
-	conf   config.Config
+	conf   *config.Config
 	logger log.Logger
 }
 
-func New(options config.Config) (*DB, error) {
-	conf, err := resolveDBConfig(defaultDBConfig, options)
-	if err != nil {
-		return nil, err
-	}
-
-	loggerConf, _ := conf.GetConfig("LOGGER")
-	logger, err := log.NewLogger(loggerConf)
-	if err != nil {
-		return nil, err
-	}
-
-	db := &DB{
-		logger: logger,
-		conf:   conf,
-	}
-
-	if err := db.resolveDBConnector(); err != nil {
-		return nil, err
-	}
-
-	if err := db.Ping(); err != nil {
-		return nil, ErrCouldNotConnect
-	}
-
-	return db, nil
-}
-
-func (db *DB) Close(ctx context.Context) error {
-	if err := db.DB.Close(); err != nil {
-		db.logger.Error(ctx, err.Error())
-	}
-	db.logger.Info(ctx, "Database connection closed")
-	if err := db.logger.Shutdown(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func NewDBWithConnector(connector *sql.DB, options config.Config) (*DB, error) {
-	conf, err := resolveDBConfig(defaultDBConfig, options)
-	if err != nil {
-		return nil, err
-	}
-
-	loggerConf, _ := conf.GetConfig("LOGGER")
-	logger, err := log.NewLogger(loggerConf)
-	if err != nil {
-		return nil, err
-	}
-
+func NewWithConnector(ctx context.Context, connector *sql.DB, logger log.Logger) (*DB, error) {
 	if err := connector.Ping(); err != nil {
 		return nil, err
 	}
@@ -134,15 +74,63 @@ func NewDBWithConnector(connector *sql.DB, options config.Config) (*DB, error) {
 	return &DB{
 		DB:     connector,
 		logger: logger,
-		conf:   conf,
 	}, nil
 }
 
-func (db *DB) NewBuilder() squirrel.StatementBuilderType {
+func (db *DB) Connect(ctx context.Context, options *config.Config) error {
+	if db.conf == nil {
+		conf, err := config.WithInitialValuesAndOptions(ctx, defaultDBConfig, options)
+		if err != nil {
+			return fmt.Errorf("could not initialize config: %w", err)
+		}
+		db.conf = conf
+	}
+
+	if db.logger == nil {
+		loggerConf, _ := db.conf.GetConfig(ctx, "LOGGER")
+		logger, err := log.Init(ctx, loggerConf)
+		if err != nil {
+			return fmt.Errorf("could not initializing logger: %w", err)
+		}
+		db.logger = logger
+	}
+
+	conn, err := resolveDBConnector(ctx, db.conf)
+	if err != nil {
+		return fmt.Errorf("could not resolve database connector: %w", err)
+	}
+
+	if err := conn.Ping(); err != nil {
+		return ErrCouldNotConnect
+	}
+
+	db.DB = conn
+	return nil
+}
+
+func (db *DB) Close(ctx context.Context) error {
+	if err := db.DB.Close(); err != nil {
+		db.logger.Error(ctx, err.Error())
+	}
+	db.logger.Info(ctx, "Database connection closed")
+	if err := db.logger.Shutdown(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func NewBuilder(ctx context.Context, dbType string) squirrel.StatementBuilderType {
 	builder := squirrel.StatementBuilder
-	if dbType, _ := db.conf.GetString("TYPE"); dbType == PostgresDBType {
+
+	switch dbType {
+	case PostgresDBType:
+		builder = builder.PlaceholderFormat(squirrel.Dollar)
+	case MysqlDBType:
+		builder = builder.PlaceholderFormat(squirrel.Question)
+	case MssqlDBType:
 		builder = builder.PlaceholderFormat(squirrel.Dollar)
 	}
+
 	return builder
 }
 
@@ -173,7 +161,7 @@ func (db *DB) Transaction(ctx context.Context, transaction TransactionFunc, opti
 
 func (db *DB) CheckTableExists(ctx context.Context, table string) (bool, error) {
 	builder := squirrel.StatementBuilder
-	if dbType, _ := db.conf.GetString("TYPE"); dbType == "postgres" {
+	if dbType, _ := db.conf.Get(ctx, "TYPE"); dbType == "postgres" {
 		builder = builder.PlaceholderFormat(squirrel.Dollar)
 	}
 	tx, err := db.BeginTx(ctx, nil)
@@ -195,27 +183,16 @@ func (db *DB) CheckTableExists(ctx context.Context, table string) (bool, error) 
 	return name == table, nil
 }
 
-func resolveDBConfig(defaults map[string]interface{}, options config.Config) (config.Config, error) {
-	conf := config.NewWithInitialValues(defaults)
-	if err := conf.Merge(options, true); err != nil {
-		return nil, err
-	}
-	if err := conf.HasAllKeys(defaults); err != nil {
-		return nil, err
-	}
-	return conf, nil
-}
-
-func (db *DB) resolveDBConnector() error {
-	dbType, _ := db.conf.GetString("TYPE")
+func resolveDBConnector(ctx context.Context, conf *config.Config) (*sql.DB, error) {
+	dbType, _ := conf.Get(ctx, "TYPE")
 	urlGen, ok := dbTypeLookup[dbType]
 	if !ok {
-		return ErrUnknownDBType
+		return nil, ErrUnknownDBType
 	}
 
-	connector, err := urlGen(db.conf)
+	connector, err := urlGen(ctx, conf)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var driver string
 	if dbType == PostgresDBType {
@@ -225,69 +202,91 @@ func (db *DB) resolveDBConnector() error {
 	}
 	conn, err := sql.Open(driver, connector)
 	if err != nil {
-		return ErrCouldNotConnect
+		return nil, ErrCouldNotConnect
 	}
-	poolConfig, _ := db.conf.GetConfig("POOL")
-	db.DB = applyPoolConfig(conn, poolConfig)
-	return nil
+	poolConfig, _ := conf.GetConfig(ctx, "POOL")
+	return applyPoolConfig(ctx, conn, poolConfig), nil
 }
 
-func applyPoolConfig(db *sql.DB, conf config.Config) *sql.DB {
-	maxOpenConns, _ := conf.GetInt("CONNS_OPEN")
+func applyPoolConfig(ctx context.Context, db *sql.DB, conf *config.Config) *sql.DB {
+	maxOpenConnsRaw, _ := conf.Get(ctx, "CONNS_OPEN")
+	maxOpenConns, err := strconv.Atoi(maxOpenConnsRaw)
+	if err != nil {
+		maxOpenConns = 1
+		conf.Set(ctx, "CONNS_OPEN", "1", true)
+	}
 	db.SetMaxOpenConns(maxOpenConns)
-	maxIdleConns, _ := conf.GetInt("CONNS_IDLE")
+
+	maxIdleConnsRaw, _ := conf.Get(ctx, "CONNS_IDLE")
+	maxIdleConns, err := strconv.Atoi(maxIdleConnsRaw)
+	if err != nil {
+		maxIdleConns = 1
+		conf.Set(ctx, "CONNS_IDLE", "1", true)
+	}
 	db.SetMaxIdleConns(maxIdleConns)
-	maxLifetime, _ := conf.GetDuration("MAX_LIFETIME")
+
+	maxLifetimeRaw, _ := conf.Get(ctx, "MAX_LIFETIME")
+	maxLifetime, err := time.ParseDuration(maxLifetimeRaw)
+	if err != nil {
+		maxLifetime = -1
+		conf.Set(ctx, "MAX_LIFETIME", "-1", true)
+	}
 	db.SetConnMaxLifetime(maxLifetime)
-	maxIdleTime, _ := conf.GetDuration("MAX_IDLE")
+
+	maxIdleTimeRaw, _ := conf.Get(ctx, "MAX_IDLE")
+	maxIdleTime, err := time.ParseDuration(maxIdleTimeRaw)
+	if err != nil {
+		maxIdleTime = -1
+		conf.Set(ctx, "MAX_IDLE", "-1", true)
+	}
 	db.SetConnMaxIdleTime(maxIdleTime)
 	return db
 }
 
-func newPostgresConnector(conf config.Config) (url string, err error) {
-	user, _ := conf.GetString("USERNAME")
-	password, _ := conf.GetString("PASSWORD")
-	host, _ := conf.GetString("HOST")
-	port, _ := conf.GetString("PORT")
-	dbName, _ := conf.GetString("NAME")
+func newPostgresConnector(ctx context.Context, conf *config.Config) (url string, err error) {
+	user, _ := conf.Get(ctx, "USERNAME")
+	password, _ := conf.Get(ctx, "PASSWORD")
+	host, _ := conf.Get(ctx, "HOST")
+	port, _ := conf.Get(ctx, "PORT")
+	dbName, _ := conf.Get(ctx, "NAME")
 	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s", user, password, host, port, dbName)
-	if sslMode, err := conf.GetString("SSLMODE"); err == nil {
+	if sslMode, err := conf.Get(ctx, "SSLMODE"); err == nil {
 		dsn += fmt.Sprintf("?sslmode=%s", sslMode)
 	} else {
 		dsn += "?sslmode=disable"
 	}
-	if timezone, err := conf.GetString("TIMEZONE"); err == nil {
+	if timezone, err := conf.Get(ctx, "TIMEZONE"); err == nil {
 		dsn += fmt.Sprintf("&TimeZone=%s", timezone)
 	}
 	return dsn, nil
 }
 
-func newMysqlConnector(conf config.Config) (url string, err error) {
-	user, _ := conf.GetString("USERNAME")
-	password, _ := conf.GetString("PASSWORD")
-	host, _ := conf.GetString("HOST")
-	port, _ := conf.GetString("PORT")
-	dbName, _ := conf.GetString("NAME")
+func newMysqlConnector(ctx context.Context, conf *config.Config) (url string, err error) {
+	user, _ := conf.Get(ctx, "USERNAME")
+	password, _ := conf.Get(ctx, "PASSWORD")
+	host, _ := conf.Get(ctx, "HOST")
+	port, _ := conf.Get(ctx, "PORT")
+	dbName, _ := conf.Get(ctx, "NAME")
 
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", user, password, host, port, dbName)
 
-	if charset, _ := conf.GetString("CHARSET"); charset != "" {
+	if charset, _ := conf.Get(ctx, "CHARSET"); charset != "" {
 		dsn += fmt.Sprintf("?charset=%s", charset)
 	}
 
 	return dsn, nil
 }
 
-func newMssqlConnector(conf config.Config) (url string, err error) {
-	user, _ := conf.GetString("USERNAME")
-	password, _ := conf.GetString("PASSWORD")
-	host, _ := conf.GetString("HOST")
-	port, _ := conf.GetString("PORT")
-	dbName, _ := conf.GetString("NAME")
+func newMssqlConnector(ctx context.Context, conf *config.Config) (url string, err error) {
+	user, _ := conf.Get(ctx, "USERNAME")
+	password, _ := conf.Get(ctx, "PASSWORD")
+	host, _ := conf.Get(ctx, "HOST")
+	port, _ := conf.Get(ctx, "PORT")
+	dbName, _ := conf.Get(ctx, "NAME")
 
 	dsn := fmt.Sprintf("sqlserver://%s:%s@%s:%s?database=%s", user, password, host, port, dbName)
 
-	if charset, _ := conf.GetString("CHARSET"); charset != "" {
+	if charset, _ := conf.Get(ctx, "CHARSET"); charset != "" {
 		dsn += fmt.Sprintf("&charset=%s", charset)
 	}
 

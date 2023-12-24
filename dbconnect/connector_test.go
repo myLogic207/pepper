@@ -1,22 +1,37 @@
-package dbconnect_test
+package dbconnect
 
 import (
 	"context"
 	"testing"
 
 	"github.com/myLogic207/gotils/config"
-	"github.com/myLogic207/pepper/dbconnect"
 	"github.com/stretchr/testify/assert"
 )
 
+var dbTestConfig = map[string]interface{}{
+	"TYPE": PostgresDBType,
+	// Add other required configuration values
+	"HOST":     "localhost",
+	"PORT":     "54321",
+	"USERNAME": "postgres",
+	"PASSWORD": "postgretest",
+	"NAME":     "postgres",
+}
+
 func TestNewDB_Postgres(t *testing.T) {
-	conf := config.NewWithInitialValues(map[string]interface{}{
-		"TYPE": dbconnect.PostgresDBType,
-		// Add other required configuration values
-	})
-	db, err := dbconnect.New(conf)
-	assert.NoError(t, err)
-	assert.NotNil(t, db)
+	ctx := context.Background()
+	conf, err := config.WithInitialValues(ctx, dbTestConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db := &DB{
+		conf: conf,
+	}
+
+	if err := db.Connect(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	// Check if the database connection is open
 	err = db.Ping()
@@ -30,13 +45,13 @@ func TestNewDB_Postgres(t *testing.T) {
 // Similar tests can be added for MySQL and MSSQL
 
 func TestCheckTableExists(t *testing.T) {
-	conf := config.NewWithInitialValues(map[string]interface{}{
-		"TYPE": dbconnect.PostgresDBType,
-		// Add other required configuration values
-	})
-	db, err := dbconnect.New(conf)
+	ctx := context.Background()
+	conf, err := config.WithInitialValues(ctx, dbTestConfig)
 	assert.NoError(t, err)
-	assert.NotNil(t, db)
+	db := &DB{}
+	if err := db.Connect(ctx, conf); err != nil {
+		t.Fatal(err)
+	}
 
 	// Use a test table name
 	tableName := "test_table"
